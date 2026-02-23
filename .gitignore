@@ -1,0 +1,20 @@
+# Build artifacts
+target/
+
+# Cargo.lock is not committed for library crates
+Cargo.lock
+
+# Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local

@@ -364,6 +364,7 @@ let config = ClientConfig::builder()
 | Campo | Tipo | Predeterminado | Descripción |
 |-------|------|---------------|-------------|
 | `prompt` | `String` | **Requerido** | Texto del prompt inicial |
+| `cli_path` | `Option<PathBuf>` | `None` | Ruta al binario CLI; si `None`, descubierto automáticamente |
 | `model` | `Option<String>` | `None` | Nombre del modelo, ej. `"claude-sonnet-4-5"` |
 | `fallback_model` | `Option<String>` | `None` | Respaldo si el modelo primario no está disponible |
 | `cwd` | `Option<PathBuf>` | `None` | Directorio de trabajo para el proceso CLI |
@@ -385,8 +386,10 @@ let config = ClientConfig::builder()
 | `connect_timeout` | `Option<Duration>` | `30s` | Tiempo límite para inicio + inicialización |
 | `close_timeout` | `Option<Duration>` | `10s` | Tiempo límite para cierre elegante |
 | `read_timeout` | `Option<Duration>` | `None` | Tiempo límite de recepción por mensaje |
+| `end_input_on_connect` | `bool` | `true` | Cerrar stdin después de iniciar (modo `--print`) |
 | `default_hook_timeout` | `Duration` | `30s` | Timeout de respaldo para callbacks de hooks |
 | `version_check_timeout` | `Option<Duration>` | `5s` | Tiempo límite para verificación de `--version` |
+| `control_request_timeout` | `Duration` | `30s` | Tiempo límite para solicitudes de control |
 
 Establece cualquier timeout `Option<Duration>` a `None` para esperar indefinidamente.
 

@@ -364,6 +364,7 @@ let config = ClientConfig::builder()
 | フィールド | 型 | デフォルト | 説明 |
 |-----------|---|---------|------|
 | `prompt` | `String` | **必須** | 初期プロンプトテキスト |
+| `cli_path` | `Option<PathBuf>` | `None` | CLI バイナリのパス；`None` の場合は自動検出 |
 | `model` | `Option<String>` | `None` | モデル名（例：`"claude-sonnet-4-5"`） |
 | `fallback_model` | `Option<String>` | `None` | プライマリモデル不可時のフォールバック |
 | `cwd` | `Option<PathBuf>` | `None` | CLI プロセスの作業ディレクトリ |
@@ -385,8 +386,10 @@ let config = ClientConfig::builder()
 | `connect_timeout` | `Option<Duration>` | `30s` | 起動 + 初期化のデッドライン |
 | `close_timeout` | `Option<Duration>` | `10s` | 優雅なシャットダウンのデッドライン |
 | `read_timeout` | `Option<Duration>` | `None` | メッセージごとの受信デッドライン |
+| `end_input_on_connect` | `bool` | `true` | 起動後に stdin を閉じる（`--print` モード） |
 | `default_hook_timeout` | `Duration` | `30s` | フックコールバックのフォールバックタイムアウト |
 | `version_check_timeout` | `Option<Duration>` | `5s` | `--version` チェックのデッドライン |
+| `control_request_timeout` | `Duration` | `30s` | コントロールリクエストのデッドライン |
 
 `Option<Duration>` タイムアウトを `None` に設定すると無制限に待機します。
 

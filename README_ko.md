@@ -364,6 +364,7 @@ let config = ClientConfig::builder()
 | 필드 | 타입 | 기본값 | 설명 |
 |------|------|--------|------|
 | `prompt` | `String` | **필수** | 초기 프롬프트 텍스트 |
+| `cli_path` | `Option<PathBuf>` | `None` | CLI 바이너리 경로; `None`이면 자동 탐색 |
 | `model` | `Option<String>` | `None` | 모델 이름 (예: `"claude-sonnet-4-5"`) |
 | `fallback_model` | `Option<String>` | `None` | 기본 모델 사용 불가 시 대체 모델 |
 | `cwd` | `Option<PathBuf>` | `None` | CLI 프로세스의 작업 디렉토리 |
@@ -385,8 +386,10 @@ let config = ClientConfig::builder()
 | `connect_timeout` | `Option<Duration>` | `30s` | 시작 + 초기화 데드라인 |
 | `close_timeout` | `Option<Duration>` | `10s` | 우아한 종료 데드라인 |
 | `read_timeout` | `Option<Duration>` | `None` | 메시지별 수신 데드라인 |
+| `end_input_on_connect` | `bool` | `true` | 시작 후 stdin 닫기 (`--print` 모드) |
 | `default_hook_timeout` | `Duration` | `30s` | 훅 콜백 폴백 타임아웃 |
 | `version_check_timeout` | `Option<Duration>` | `5s` | `--version` 확인 데드라인 |
+| `control_request_timeout` | `Duration` | `30s` | 제어 요청 데드라인 |
 
 `Option<Duration>` 타임아웃을 `None`으로 설정하면 무기한 대기합니다.
 

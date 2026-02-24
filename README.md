@@ -364,6 +364,7 @@ let config = ClientConfig::builder()
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `prompt` | `String` | **Required** | Initial prompt text |
+| `cli_path` | `Option<PathBuf>` | `None` | Path to CLI binary; if `None`, auto-discovered |
 | `model` | `Option<String>` | `None` | Model name, e.g. `"claude-sonnet-4-5"` |
 | `fallback_model` | `Option<String>` | `None` | Fallback if primary model is unavailable |
 | `cwd` | `Option<PathBuf>` | `None` | Working directory for the CLI process |
@@ -385,8 +386,10 @@ let config = ClientConfig::builder()
 | `connect_timeout` | `Option<Duration>` | `30s` | Deadline for spawn + init |
 | `close_timeout` | `Option<Duration>` | `10s` | Deadline for graceful shutdown |
 | `read_timeout` | `Option<Duration>` | `None` | Per-message recv deadline |
+| `end_input_on_connect` | `bool` | `true` | Close stdin after spawn (`--print` mode) |
 | `default_hook_timeout` | `Duration` | `30s` | Hook callback fallback timeout |
 | `version_check_timeout` | `Option<Duration>` | `5s` | `--version` check deadline |
+| `control_request_timeout` | `Duration` | `30s` | Deadline for control requests |
 
 Set any `Option<Duration>` timeout to `None` to wait indefinitely.
 

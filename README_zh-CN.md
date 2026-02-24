@@ -364,6 +364,7 @@ let config = ClientConfig::builder()
 | 字段 | 类型 | 默认值 | 描述 |
 |------|------|--------|------|
 | `prompt` | `String` | **必填** | 初始提示文本 |
+| `cli_path` | `Option<PathBuf>` | `None` | CLI 二进制文件路径；`None` 时自动发现 |
 | `model` | `Option<String>` | `None` | 模型名称，如 `"claude-sonnet-4-5"` |
 | `fallback_model` | `Option<String>` | `None` | 主模型不可用时的备用模型 |
 | `cwd` | `Option<PathBuf>` | `None` | CLI 进程的工作目录 |
@@ -385,8 +386,10 @@ let config = ClientConfig::builder()
 | `connect_timeout` | `Option<Duration>` | `30s` | 启动 + 初始化超时 |
 | `close_timeout` | `Option<Duration>` | `10s` | 优雅关闭超时 |
 | `read_timeout` | `Option<Duration>` | `None` | 单条消息接收超时 |
+| `end_input_on_connect` | `bool` | `true` | 启动后关闭 stdin（`--print` 模式） |
 | `default_hook_timeout` | `Duration` | `30s` | 钩子回调默认超时 |
 | `version_check_timeout` | `Option<Duration>` | `5s` | `--version` 检查超时 |
+| `control_request_timeout` | `Duration` | `30s` | 控制请求超时 |
 
 将任何 `Option<Duration>` 超时设为 `None` 可无限等待。
 

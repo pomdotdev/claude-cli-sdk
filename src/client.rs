@@ -371,6 +371,13 @@ impl Client {
         self.message_rx = Some(msg_rx);
         self.shutdown_tx = Some(shutdown_tx);
 
+        // If an init trigger message is configured (e.g., for --input-format
+        // stream-json mode), write it to stdin now. The CLI won't emit the
+        // system/init message until it receives stdin input in this mode.
+        if let Some(ref msg) = self.config.init_stdin_message {
+            self.transport.write(msg).await?;
+        }
+
         // Wait for the system/init message.
         // The overall connect_timeout is enforced by the caller, so we wait
         // indefinitely here (the outer timeout will cancel us if needed).
@@ -522,6 +529,20 @@ impl Client {
                 }
             }
         })
+    }
+
+    /// Write raw text to the CLI's stdin without creating a response stream.
+    ///
+    /// Use this only when [`receive_messages()`] is already consuming responses.
+    /// **Do not call this while a [`send()`] turn is in progress** — doing so
+    /// interleaves writes on the same stdin handle and produces undefined
+    /// protocol behaviour.
+    pub async fn write_to_stdin(&self, text: &str) -> Result<()> {
+        debug_assert!(
+            !self.turn_active.load(Ordering::Relaxed),
+            "write_to_stdin called while a send() turn is active"
+        );
+        self.transport.write(text).await
     }
 
     /// Send an interrupt signal to the CLI (SIGINT).

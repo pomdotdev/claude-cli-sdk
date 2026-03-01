@@ -29,6 +29,21 @@ use crate::hooks::HookMatcher;
 use crate::mcp::McpServers;
 use crate::permissions::CanUseToolCallback;
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// The `stream-json` input format value for [`ClientConfig::input_format`].
+///
+/// When set as the input format, the CLI reads all user messages from stdin
+/// as NDJSON. `--print` is omitted and [`ClientConfig::init_stdin_message`]
+/// must be provided to unblock the init handshake.
+pub const INPUT_FORMAT_STREAM_JSON: &str = "stream-json";
+
+/// The `stream-json` output format value for [`ClientConfig::output_format`].
+///
+/// Enables realtime NDJSON streaming — required for the SDK's init handshake
+/// and multi-turn conversations. This is the default output format.
+pub const OUTPUT_FORMAT_STREAM_JSON: &str = "stream-json";
+
 // ── ClientConfig ─────────────────────────────────────────────────────────────
 
 /// Configuration for a Claude Code SDK client session.
@@ -227,6 +242,32 @@ pub struct ClientConfig {
     /// Optional callback for CLI stderr output.
     #[builder(default, setter(strip_option))]
     pub stderr_callback: Option<Arc<dyn Fn(String) + Send + Sync>>,
+
+    /// Input format for the CLI session.
+    ///
+    /// Set to [`INPUT_FORMAT_STREAM_JSON`] for bidirectional multi-turn
+    /// streaming (the CLI reads all messages from stdin as NDJSON). When set,
+    /// `--print` is omitted and [`init_stdin_message`](Self::init_stdin_message)
+    /// must provide the first message to unblock the init handshake.
+    ///
+    /// Default: `None` (standard `--print` mode).
+    #[builder(default, setter(strip_option, into))]
+    pub input_format: Option<String>,
+
+    /// Optional message to write to stdin immediately after spawning the CLI,
+    /// before waiting for the init message.
+    ///
+    /// This is needed when using `--input-format stream-json` (without `--print`),
+    /// because the CLI waits for stdin input before emitting the `system/init`
+    /// message. Writing a trigger message unblocks the init handshake.
+    ///
+    /// The message should be a valid JSON user message for `stream-json` mode.
+    /// Note: the CLI will process this message and produce a response that
+    /// flows through the normal message channel.
+    ///
+    /// Default: `None` (no trigger — suitable for `--print` mode).
+    #[builder(default, setter(strip_option, into))]
+    pub init_stdin_message: Option<String>,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -346,6 +387,27 @@ impl ClientConfig {
                 )));
             }
         }
+
+        if let Some(ref msg) = self.init_stdin_message {
+            serde_json::from_str::<serde_json::Value>(msg).map_err(|e| {
+                crate::errors::Error::Config(format!("init_stdin_message is not valid JSON: {e}"))
+            })?;
+        }
+
+        if self.init_stdin_message.is_some()
+            && self.input_format.as_deref() != Some(INPUT_FORMAT_STREAM_JSON)
+        {
+            return Err(crate::errors::Error::Config(
+                "init_stdin_message requires input_format = \"stream-json\"".into(),
+            ));
+        }
+
+        if self.input_format.is_some() && self.extra_args.contains_key("input-format") {
+            return Err(crate::errors::Error::Config(
+                "input_format and extra_args[\"input-format\"] are mutually exclusive; use input_format".into(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -354,16 +416,25 @@ impl ClientConfig {
     /// This does NOT include the binary path itself — just the arguments.
     #[must_use]
     pub fn to_cli_args(&self) -> Vec<String> {
-        let mut args = vec![
-            "--output-format".into(),
-            self.output_format.clone(),
-            "--print".into(),
-            self.prompt.clone(),
-        ];
+        let mut args = vec!["--output-format".into(), self.output_format.clone()];
 
-        // stream-json output requires --verbose and benefits from
-        // --input-format stream-json for bidirectional streaming.
-        if self.output_format == "stream-json" && !self.verbose {
+        // In --input-format stream-json mode the CLI reads all user messages
+        // from stdin as NDJSON. --print must be omitted; passing it would waste
+        // an API call on an empty prompt.
+        let uses_stream_input = self.input_format.as_deref() == Some(INPUT_FORMAT_STREAM_JSON);
+
+        if !uses_stream_input {
+            args.push("--print".into());
+            args.push(self.prompt.clone());
+        }
+
+        if let Some(ref fmt) = self.input_format {
+            args.push("--input-format".into());
+            args.push(fmt.clone());
+        }
+
+        // stream-json output requires --verbose.
+        if self.output_format == OUTPUT_FORMAT_STREAM_JSON && !self.verbose {
             args.push("--verbose".into());
         }
 
@@ -458,8 +529,11 @@ impl ClientConfig {
     ///
     /// SDK defaults:
     /// - `CLAUDE_CODE_SDK_ORIGINATOR=claude_cli_sdk_rs` — telemetry originator
-    /// - `CI=true` — headless mode (suppress interactive prompts)
     /// - `TERM=dumb` — prevent ANSI escape sequences in output
+    ///
+    /// NOTE: `CI=true` is intentionally NOT set. Claude Code CLI v2.1+ treats
+    /// `CI=true` as a signal to suppress ALL output (stdout + stderr), which
+    /// breaks the NDJSON streaming protocol this SDK relies on.
     #[must_use]
     pub fn to_env(&self) -> HashMap<String, String> {
         let mut env = HashMap::new();
@@ -469,7 +543,6 @@ impl ClientConfig {
             "CLAUDE_CODE_SDK_ORIGINATOR".into(),
             "claude_cli_sdk_rs".into(),
         );
-        env.insert("CI".into(), "true".into());
         env.insert("TERM".into(), "dumb".into());
 
         // User-supplied env overrides defaults
@@ -602,7 +675,7 @@ mod tests {
             env.get("CLAUDE_CODE_SDK_ORIGINATOR"),
             Some(&"claude_cli_sdk_rs".into())
         );
-        assert_eq!(env.get("CI"), Some(&"true".into()));
+        assert!(!env.contains_key("CI"), "CI must not be set by default");
         assert_eq!(env.get("TERM"), Some(&"dumb".into()));
     }
 
@@ -610,14 +683,10 @@ mod tests {
     fn to_env_user_env_overrides_defaults() {
         let config = ClientConfig::builder()
             .prompt("test")
-            .env(HashMap::from([
-                ("CI".into(), "false".into()),
-                ("TERM".into(), "xterm-256color".into()),
-            ]))
+            .env(HashMap::from([("TERM".into(), "xterm-256color".into())]))
             .build();
         let env = config.to_env();
-        // User-supplied values should override SDK defaults.
-        assert_eq!(env.get("CI"), Some(&"false".into()));
+        // User-supplied value should override SDK default.
         assert_eq!(env.get("TERM"), Some(&"xterm-256color".into()));
         // Originator should still be present (not overridden).
         assert_eq!(
@@ -778,5 +847,70 @@ mod tests {
         let args = config.to_cli_args();
         assert!(args.contains(&"--resume".into()));
         assert!(args.contains(&"session-123".into()));
+    }
+
+    #[test]
+    fn to_cli_args_stream_input_format_omits_print() {
+        let config = ClientConfig::builder()
+            .prompt("ignored")
+            .input_format(INPUT_FORMAT_STREAM_JSON)
+            .build();
+        let args = config.to_cli_args();
+        assert!(
+            !args.contains(&"--print".into()),
+            "--print must be absent in stream-json input mode"
+        );
+        assert!(args.contains(&"--input-format".into()));
+        let idx = args.iter().position(|a| a == "--input-format").unwrap();
+        assert_eq!(args[idx + 1], INPUT_FORMAT_STREAM_JSON);
+    }
+
+    #[test]
+    fn to_cli_args_input_format_emitted() {
+        let config = ClientConfig::builder()
+            .prompt("test")
+            .input_format("custom-format")
+            .build();
+        let args = config.to_cli_args();
+        assert!(args.contains(&"--input-format".into()));
+        let idx = args.iter().position(|a| a == "--input-format").unwrap();
+        assert_eq!(args[idx + 1], "custom-format");
+    }
+
+    #[test]
+    fn validate_init_stdin_message_valid_json() {
+        let config = ClientConfig::builder()
+            .prompt("ignored")
+            .input_format(INPUT_FORMAT_STREAM_JSON)
+            .init_stdin_message(r#"{"type":"user","message":{"role":"user","content":"hello"}}"#)
+            .build();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_init_stdin_message_invalid_json() {
+        let config = ClientConfig::builder()
+            .prompt("ignored")
+            .input_format(INPUT_FORMAT_STREAM_JSON)
+            .init_stdin_message("not valid json {")
+            .build();
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, crate::errors::Error::Config(ref msg) if msg.contains("not valid JSON")),
+            "expected Config error about JSON validity, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_init_stdin_message_without_input_format() {
+        let config = ClientConfig::builder()
+            .prompt("ignored")
+            .init_stdin_message(r#"{"type":"user"}"#)
+            .build();
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, crate::errors::Error::Config(ref msg) if msg.contains("input_format")),
+            "expected Config error about missing input_format, got: {err:?}"
+        );
     }
 }

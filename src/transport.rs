@@ -158,6 +158,18 @@ impl CliTransport {
             cmd.env(k, v);
         }
 
+        // Strip Claude Code env vars so the child CLI process doesn't think
+        // it's nested inside another Claude Code session. This happens when
+        // the SDK is used from a daemon that was itself started from Claude Code.
+        // - CLAUDECODE: Presence triggers "cannot launch inside another session" error
+        // - CLAUDE_CODE_SSE_PORT: Causes child to connect to parent's SSE port
+        // - CLAUDE_CODE_ENTRYPOINT: Inherited entrypoint context from parent
+        // NOTE: These removes run AFTER the user env loop so they can never be
+        // re-added by a caller passing them through ClientConfig::env.
+        cmd.env_remove("CLAUDECODE");
+        cmd.env_remove("CLAUDE_CODE_SSE_PORT");
+        cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
+
         // On Windows, create the child in its own process group so that
         // interrupt signals can target it without affecting the host process.
         #[cfg(windows)]

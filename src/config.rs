@@ -468,6 +468,15 @@ impl ClientConfig {
             args.push(self.permission_mode.as_cli_flag().into());
         }
 
+        // When a can_use_tool callback is configured, tell the CLI to route
+        // permission requests through the stdio control protocol instead of
+        // its built-in interactive terminal prompt. Without this flag the CLI
+        // handles permissions internally and the callback never fires.
+        if self.can_use_tool.is_some() {
+            args.push("--permission-prompt-tool".into());
+            args.push("stdio".into());
+        }
+
         if let Some(resume) = &self.resume {
             args.push("--resume".into());
             args.push(resume.clone());

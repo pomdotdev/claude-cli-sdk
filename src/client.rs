@@ -76,6 +76,39 @@ pub(crate) async fn recv_with_timeout(
     }
 }
 
+// ── Control protocol helpers ────────────────────────────────────────────────
+
+fn build_control_response_success(
+    request_id: &str,
+    response: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": response
+        }
+    })
+}
+
+fn build_control_response_error(request_id: &str, error: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "error",
+            "request_id": request_id,
+            "error": error.into()
+        }
+    })
+}
+
+async fn write_json_line(transport: &dyn Transport, value: serde_json::Value) {
+    if let Ok(json) = serde_json::to_string(&value) {
+        let _ = transport.write(&json).await;
+    }
+}
+
 // ── Shared turn stream helper ─────────────────────────────────────────────────
 
 /// Read messages from the receiver until a `Result` message or error,
@@ -248,9 +281,15 @@ impl Client {
                         match item {
                             Some(Ok(value)) => {
                                 // Route control_response messages to pending senders.
+                                // The request_id may be at the top level or nested
+                                // under response.request_id.
                                 if value.get("type").and_then(|v| v.as_str()) == Some("control_response") {
-                                    if let Some(req_id) = value.get("request_id").and_then(|v| v.as_str()) {
-                                        if let Some((_, tx)) = pending_control.remove(req_id) {
+                                    let req_id = value.get("request_id")
+                                        .and_then(|v| v.as_str())
+                                        .or_else(|| value.pointer("/response/request_id")
+                                            .and_then(|v| v.as_str()));
+                                    if let Some(rid) = req_id {
+                                        if let Some((_, tx)) = pending_control.remove(rid) {
                                             let _ = tx.send(value);
                                         }
                                     }
@@ -281,7 +320,204 @@ impl Client {
                                     continue;
                                 }
 
-                                // Route permission_request messages to the can_use_tool callback.
+                                // Route control_request messages (permissions, hooks).
+                                //
+                                // The CLI sends: {"type": "control_request", "request_id": "...",
+                                //   "request": {"subtype": "can_use_tool"|"hook_callback", ...}}
+                                // We respond: {"type": "control_response", "response":
+                                //   {"subtype": "success"|"error", "request_id": "...", "response": {...}}}
+                                if value.get("type").and_then(|v| v.as_str()) == Some("control_request") {
+                                    let request_id = value.get("request_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    if request_id.is_empty() {
+                                        let _ = msg_tx.send(Err(Error::ControlProtocol(
+                                            "received control_request without request_id".into(),
+                                        )));
+                                        continue;
+                                    }
+                                    let subtype = value.pointer("/request/subtype")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+
+                                    match subtype {
+                                        "can_use_tool" => {
+                                            let request = value.get("request").cloned()
+                                                .unwrap_or_default();
+                                            let tool_name = request.get("tool_name")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                            let tool_input = request.get("input")
+                                                .cloned()
+                                                .unwrap_or(serde_json::Value::Null);
+                                            let tool_use_id = request.get("tool_use_id")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                            let suggestions: Vec<String> = request
+                                                .get("permission_suggestions")
+                                                .and_then(|v| v.as_array())
+                                                .map(|arr| arr.iter()
+                                                    .filter_map(|v| v.as_str().map(String::from))
+                                                    .collect())
+                                                .unwrap_or_default();
+
+                                            if let Some(ref callback) = can_use_tool {
+                                                let sid = hook_session_id
+                                                    .lock()
+                                                    .expect("session_id lock")
+                                                    .clone()
+                                                    .unwrap_or_default();
+                                                let ctx = crate::permissions::PermissionContext {
+                                                    tool_use_id,
+                                                    session_id: sid,
+                                                    request_id: request_id.clone(),
+                                                    suggestions,
+                                                };
+                                                let decision = callback(&tool_name, &tool_input, ctx).await;
+
+                                                // Build response matching Python SDK format.
+                                                let response_data = match decision {
+                                                    crate::permissions::PermissionDecision::Allow { updated_input } => {
+                                                        let input = updated_input.unwrap_or(tool_input);
+                                                        serde_json::json!({
+                                                            "behavior": "allow",
+                                                            "updatedInput": input
+                                                        })
+                                                    }
+                                                    crate::permissions::PermissionDecision::Deny { message, interrupt } => {
+                                                        let mut d = serde_json::json!({
+                                                            "behavior": "deny",
+                                                            "message": message
+                                                        });
+                                                        if interrupt {
+                                                            d["interrupt"] = serde_json::json!(true);
+                                                        }
+                                                        d
+                                                    }
+                                                };
+                                                let response =
+                                                    build_control_response_success(&request_id, response_data);
+                                                write_json_line(&*perm_transport, response).await;
+                                            } else {
+                                                let response = build_control_response_error(
+                                                    &request_id,
+                                                    "no can_use_tool callback configured",
+                                                );
+                                                write_json_line(&*perm_transport, response).await;
+                                                let _ = msg_tx.send(Err(Error::ControlProtocol(
+                                                    "received can_use_tool control_request but no \
+                                                     callback is configured"
+                                                        .into(),
+                                                )));
+                                            }
+                                        }
+                                        "hook_callback" => {
+                                            let request = value.get("request").cloned()
+                                                .unwrap_or_default();
+                                            let hook_event_str = request.get("hook_event_name")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            let hook_tool_name = request.get("tool_name")
+                                                .and_then(|v| v.as_str())
+                                                .map(String::from);
+                                            let hook_tool_input = request.get("tool_input").cloned();
+                                            let hook_tool_result = request.get("tool_result").cloned();
+                                            let hook_tool_use_id = request.get("tool_use_id")
+                                                .and_then(|v| v.as_str())
+                                                .map(String::from);
+
+                                            // Map hook event name string to HookEvent enum.
+                                            let hook_event = match hook_event_str {
+                                                "PreToolUse" => Some(crate::hooks::HookEvent::PreToolUse),
+                                                "PostToolUse" => Some(crate::hooks::HookEvent::PostToolUse),
+                                                "PostToolUseFailure" => Some(crate::hooks::HookEvent::PostToolUseFailure),
+                                                "UserPromptSubmit" => Some(crate::hooks::HookEvent::UserPromptSubmit),
+                                                "Stop" => Some(crate::hooks::HookEvent::Stop),
+                                                "SubagentStop" => Some(crate::hooks::HookEvent::SubagentStop),
+                                                "PreCompact" => Some(crate::hooks::HookEvent::PreCompact),
+                                                "Notification" => Some(crate::hooks::HookEvent::Notification),
+                                                _ => None,
+                                            };
+
+                                            if let Some(event) = hook_event {
+                                                let req = crate::hooks::HookRequest {
+                                                    request_id: request_id.clone(),
+                                                    hook_event: event,
+                                                    tool_name: hook_tool_name,
+                                                    tool_input: hook_tool_input,
+                                                    tool_result: hook_tool_result,
+                                                    tool_use_id: hook_tool_use_id,
+                                                };
+                                                let sid = hook_session_id
+                                                    .lock()
+                                                    .expect("session_id lock")
+                                                    .clone();
+                                                let output = crate::hooks::dispatch_hook(
+                                                    &req,
+                                                    &hooks,
+                                                    default_hook_timeout,
+                                                    sid,
+                                                ).await;
+
+                                                // Convert HookOutput to control_response format.
+                                                let response_data = match output.decision {
+                                                    crate::hooks::HookDecision::Allow => {
+                                                        serde_json::json!({"continue_": true})
+                                                    }
+                                                    crate::hooks::HookDecision::Block => {
+                                                        serde_json::json!({
+                                                            "continue_": false,
+                                                            "reason": output.reason.unwrap_or_default()
+                                                        })
+                                                    }
+                                                    crate::hooks::HookDecision::Modify => {
+                                                        let mut d = serde_json::json!({"continue_": true});
+                                                        if let Some(input) = output.updated_input {
+                                                            d["updatedInput"] = input;
+                                                        }
+                                                        d
+                                                    }
+                                                    crate::hooks::HookDecision::Abort => {
+                                                        serde_json::json!({
+                                                            "continue_": false,
+                                                            "reason": output.reason.unwrap_or_default()
+                                                        })
+                                                    }
+                                                };
+                                                let response =
+                                                    build_control_response_success(&request_id, response_data);
+                                                write_json_line(&*hook_transport, response).await;
+                                            } else {
+                                                // Unknown hook event — respond with success/continue
+                                                // to avoid blocking the CLI.
+                                                let response = build_control_response_success(
+                                                    &request_id,
+                                                    serde_json::json!({"continue_": true}),
+                                                );
+                                                write_json_line(&*hook_transport, response).await;
+                                                let _ = msg_tx.send(Err(Error::ControlProtocol(
+                                                    format!(
+                                                        "received unknown hook_event_name: {hook_event_str}"
+                                                    ),
+                                                )));
+                                            }
+                                        }
+                                        _ => {
+                                            // Unknown subtype — respond with error.
+                                            let response = build_control_response_error(
+                                                &request_id,
+                                                format!("unknown control_request subtype: {subtype}"),
+                                            );
+                                            write_json_line(&*perm_transport, response).await;
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                // Legacy: route permission_request messages (pre-control_request format).
                                 if value.get("type").and_then(|v| v.as_str()) == Some("permission_request") {
                                     if let Some(ref callback) = can_use_tool {
                                         if let Ok(req) = serde_json::from_value::<crate::permissions::ControlRequest>(value) {
@@ -313,8 +549,6 @@ impl Client {
                                             }
                                         }
                                     } else {
-                                        // No can_use_tool callback configured. Send a deny
-                                        // response so the CLI doesn't hang waiting forever.
                                         let deny_response = serde_json::json!({
                                             "kind": "permission_response",
                                             "request_id": value.get("request_id")
@@ -330,9 +564,7 @@ impl Client {
                                         }
                                         let _ = msg_tx.send(Err(Error::ControlProtocol(
                                             "received permission_request but no can_use_tool \
-                                             callback is configured — set can_use_tool on \
-                                             ClientConfig or use a PermissionMode that does not \
-                                             require interactive approval"
+                                             callback is configured"
                                                 .into(),
                                         )));
                                     }
@@ -1060,6 +1292,222 @@ mod tests {
         // With no cancel token and a short timeout, we should get a timeout error.
         let result = recv_with_timeout(&rx, Some(Duration::from_millis(10)), None).await;
         assert!(matches!(result, Err(Error::Timeout(_))));
+    }
+
+    // ── control_request (new wire format) tests ──────────────────────
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn client_control_request_can_use_tool_allow() {
+        use crate::permissions::{CanUseToolCallback, PermissionDecision};
+        use crate::testing::MockTransport;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_clone = Arc::clone(&invoked);
+
+        let callback: CanUseToolCallback = Arc::new(move |tool_name: &str, _input, _ctx| {
+            let invoked = Arc::clone(&invoked_clone);
+            let tool = tool_name.to_owned();
+            Box::pin(async move {
+                invoked.store(true, AtomicOrdering::Release);
+                assert_eq!(tool, "Bash");
+                PermissionDecision::allow()
+            })
+        });
+
+        let config = ClientConfig::builder()
+            .prompt("test")
+            .can_use_tool(callback)
+            .build();
+
+        let transport = MockTransport::new();
+        transport.enqueue(r#"{"type":"system","subtype":"init","session_id":"s1","cwd":"/","tools":[],"mcp_servers":[],"model":"m"}"#);
+        // control_request with can_use_tool subtype (actual CLI wire format).
+        transport.enqueue(r#"{"type":"control_request","request_id":"cr-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"tool_use_id":"tu-1","permission_suggestions":["allow_once"]}}"#);
+        transport.enqueue(&serde_json::to_string(&crate::testing::assistant_text("done")).unwrap());
+        transport.enqueue(r#"{"type":"result","subtype":"success","session_id":"s1","is_error":false,"num_turns":1,"usage":{}}"#);
+        let transport = Arc::new(transport);
+
+        let mut client = Client::with_transport(config, transport.clone()).unwrap();
+        client.connect().await.unwrap();
+
+        let stream = client.send("hello").unwrap();
+        tokio::pin!(stream);
+        let mut messages = Vec::new();
+        while let Some(msg) = stream.next().await {
+            messages.push(msg.unwrap());
+        }
+
+        assert!(
+            invoked.load(AtomicOrdering::Acquire),
+            "permission callback was not invoked"
+        );
+
+        // control_request should NOT leak as a Message — only assistant + result.
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(&messages[0], Message::Assistant(_)));
+        assert!(matches!(&messages[1], Message::Result(_)));
+
+        // Verify a control_response was written back with correct format.
+        let written = transport.written_lines();
+        let responses: Vec<_> = written
+            .iter()
+            .filter(|line| line.contains("control_response"))
+            .collect();
+        assert_eq!(responses.len(), 1, "expected exactly one control_response");
+        let resp: serde_json::Value = serde_json::from_str(responses[0]).unwrap();
+        assert_eq!(resp["type"], "control_response");
+        assert_eq!(resp["response"]["subtype"], "success");
+        assert_eq!(resp["response"]["request_id"], "cr-1");
+        assert_eq!(resp["response"]["response"]["behavior"], "allow");
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn client_control_request_can_use_tool_deny() {
+        use crate::permissions::{CanUseToolCallback, PermissionDecision};
+        use crate::testing::MockTransport;
+
+        let callback: CanUseToolCallback = Arc::new(|_tool_name, _input, _ctx| {
+            Box::pin(async { PermissionDecision::deny("forbidden") })
+        });
+
+        let config = ClientConfig::builder()
+            .prompt("test")
+            .can_use_tool(callback)
+            .build();
+
+        let transport = MockTransport::new();
+        transport.enqueue(r#"{"type":"system","subtype":"init","session_id":"s1","cwd":"/","tools":[],"mcp_servers":[],"model":"m"}"#);
+        transport.enqueue(r#"{"type":"control_request","request_id":"cr-2","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"path":"/etc/shadow"},"tool_use_id":"tu-2","permission_suggestions":[]}}"#);
+        transport
+            .enqueue(&serde_json::to_string(&crate::testing::assistant_text("denied")).unwrap());
+        transport.enqueue(r#"{"type":"result","subtype":"success","session_id":"s1","is_error":false,"num_turns":1,"usage":{}}"#);
+        let transport = Arc::new(transport);
+
+        let mut client = Client::with_transport(config, transport.clone()).unwrap();
+        client.connect().await.unwrap();
+
+        let stream = client.send("hello").unwrap();
+        tokio::pin!(stream);
+        let mut messages = Vec::new();
+        while let Some(msg) = stream.next().await {
+            messages.push(msg.unwrap());
+        }
+
+        let written = transport.written_lines();
+        let responses: Vec<_> = written
+            .iter()
+            .filter(|line| line.contains("control_response"))
+            .collect();
+        assert_eq!(responses.len(), 1);
+        let resp: serde_json::Value = serde_json::from_str(responses[0]).unwrap();
+        assert_eq!(resp["type"], "control_response");
+        assert_eq!(resp["response"]["response"]["behavior"], "deny");
+        assert_eq!(resp["response"]["response"]["message"], "forbidden");
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn client_control_request_no_callback_yields_error() {
+        use crate::testing::MockTransport;
+
+        // No can_use_tool callback configured.
+        let config = ClientConfig::builder().prompt("test").build();
+
+        let transport = MockTransport::new();
+        transport.enqueue(r#"{"type":"system","subtype":"init","session_id":"s1","cwd":"/","tools":[],"mcp_servers":[],"model":"m"}"#);
+        transport.enqueue(r#"{"type":"control_request","request_id":"cr-3","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"tool_use_id":"tu-3","permission_suggestions":[]}}"#);
+        transport
+            .enqueue(&serde_json::to_string(&crate::testing::assistant_text("after")).unwrap());
+        transport.enqueue(r#"{"type":"result","subtype":"success","session_id":"s1","is_error":false,"num_turns":1,"usage":{}}"#);
+        let transport = Arc::new(transport);
+
+        let mut client = Client::with_transport(config, transport.clone()).unwrap();
+        client.connect().await.unwrap();
+
+        let stream = client.send("hello").unwrap();
+        tokio::pin!(stream);
+
+        let mut got_error = false;
+        let mut messages = Vec::new();
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(msg) => messages.push(msg),
+                Err(Error::ControlProtocol(ref msg)) if msg.contains("can_use_tool") => {
+                    got_error = true;
+                }
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        assert!(
+            got_error,
+            "should have received a ControlProtocol error for missing callback"
+        );
+
+        // Verify error control_response was written.
+        let written = transport.written_lines();
+        let responses: Vec<_> = written
+            .iter()
+            .filter(|line| line.contains("control_response"))
+            .collect();
+        assert_eq!(responses.len(), 1);
+        let resp: serde_json::Value = serde_json::from_str(responses[0]).unwrap();
+        assert_eq!(resp["response"]["subtype"], "error");
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn client_control_request_hook_callback() {
+        use crate::hooks::{HookCallback, HookEvent, HookMatcher, HookOutput};
+        use crate::testing::MockTransport;
+
+        // Register a PreToolUse hook that allows.
+        let callback: HookCallback = Arc::new(|_, _, _| Box::pin(async { HookOutput::allow() }));
+
+        let config = ClientConfig::builder()
+            .prompt("test")
+            .hooks(vec![HookMatcher::new(HookEvent::PreToolUse, callback)])
+            .build();
+
+        let transport = MockTransport::new();
+        transport.enqueue(r#"{"type":"system","subtype":"init","session_id":"s1","cwd":"/","tools":[],"mcp_servers":[],"model":"m"}"#);
+        transport.enqueue(r#"{"type":"control_request","request_id":"hook-1","request":{"subtype":"hook_callback","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"},"tool_use_id":"tu-h1"}}"#);
+        transport
+            .enqueue(&serde_json::to_string(&crate::testing::assistant_text("hooked")).unwrap());
+        transport.enqueue(r#"{"type":"result","subtype":"success","session_id":"s1","is_error":false,"num_turns":1,"usage":{}}"#);
+        let transport = Arc::new(transport);
+
+        let mut client = Client::with_transport(config, transport.clone()).unwrap();
+        client.connect().await.unwrap();
+
+        let stream = client.send("hello").unwrap();
+        tokio::pin!(stream);
+        let mut messages = Vec::new();
+        while let Some(msg) = stream.next().await {
+            messages.push(msg.unwrap());
+        }
+
+        // Hook control_request should not leak as a Message.
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(&messages[0], Message::Assistant(_)));
+        assert!(matches!(&messages[1], Message::Result(_)));
+
+        // Verify control_response for hook was written.
+        let written = transport.written_lines();
+        let responses: Vec<_> = written
+            .iter()
+            .filter(|line| line.contains("control_response"))
+            .collect();
+        assert_eq!(responses.len(), 1);
+        let resp: serde_json::Value = serde_json::from_str(responses[0]).unwrap();
+        assert_eq!(resp["type"], "control_response");
+        assert_eq!(resp["response"]["subtype"], "success");
+        assert_eq!(resp["response"]["request_id"], "hook-1");
+        // Hook Allow → continue_: true
+        assert_eq!(resp["response"]["response"]["continue_"], true);
     }
 
     #[cfg(feature = "testing")]

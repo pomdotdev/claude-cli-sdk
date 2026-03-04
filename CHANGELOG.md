@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-03-03
+
+### Fixed
+
+- Handle control_request permissions and hook callbacks using the CLI wire format
+- Reject control_request messages without request_id to avoid mis-correlation
+- Warn on unknown hook event names while allowing the CLI to continue
+- Route permission prompts to stdio when can_use_tool is configured
+
 ## [0.5.0] - 2026-02-28
 
 ### Added
@@ -47,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unix-only platform guard (macOS/Linux)
 - 10 numbered examples with i18n documentation (English, Spanish, Japanese, Korean, Simplified Chinese)
 
-[Unreleased]: https://github.com/pomdotdev/claude-cli-sdk/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/pomdotdev/claude-cli-sdk/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/pomdotdev/claude-cli-sdk/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/pomdotdev/claude-cli-sdk/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/pomdotdev/claude-cli-sdk/releases/tag/v0.4.0
